@@ -1,0 +1,213 @@
+#!/bin/bash
+# Seam - 여러 리눅스 기계를 한 루트 # 아래 묶는 셸
+SEAM_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+export SEAM_DIR
+source "$SEAM_DIR/linux/common.sh"
+
+banner() { printf '\e[1;36m  ___  ___  __ _  _ __ ___\n / __|/ _ \\/ _` || `_ ` _ \\\n \\__ \\  __/ (_| || | | | | |\n |___/\\___|\\__,_||_| |_| |_|\e[0m  \e[2mv%s\e[0m\n\n' "$SEAM_VERSION"; }
+
+ask() {
+  local q=$1 d=$2
+  if [ -n "$d" ]; then read -rp "  $q [$d]: " REPLY; REPLY=${REPLY:-$d}
+  else read -rp "  $q: " REPLY; fi
+}
+yesno() {
+  local d=${2:-Y} a
+  read -rp "  $1 [$([ $d = Y ] && echo Y/n || echo y/N)]: " a; a=${a:-$d}
+  [[ $a == [Yy]* ]]
+}
+
+# ---------------- setup ----------------
+cmd_setup() {
+  banner
+  echo -e "\e[1m Seam 설정\e[0m  - 이 기계와 묶을 다른 기계들을 정합니다."
+  echo -e " \e[2m(설정 파일: $SEAM_CONF)\e[0m\n"
+
+  # 0. 필요한 프로그램
+  echo -e "\e[1m[1/3] 이 기계 준비\e[0m"
+  local miss=() p
+  for p in ssh sshfs fusermount; do command -v $p >/dev/null || miss+=($p); done
+  if [ ${#miss[@]} -eq 0 ]; then _seam_ok "ssh, sshfs 있음"
+  else
+    _seam_bad "없음: ${miss[*]}"
+    local pk="openssh-client sshfs"
+    if command -v apt-get >/dev/null && yesno "지금 설치할까요? (sudo apt install $pk, 약 1MB)" Y; then
+      sudo apt-get install -y $pk && _seam_ok "설치됨" || { _seam_bad "설치 실패 - 직접 설치 후 다시 seam setup"; return 1; }
+    else
+      _seam_note "직접 설치하세요:  sudo apt install $pk   (Fedora: sudo dnf install fuse-sshfs)"
+      _seam_note "설치 전에도 설정은 저장되지만, 다른 기계 홈은 안 붙습니다."
+    fi
+  fi
+  if pgrep -x sshd >/dev/null || systemctl is-active -q ssh.socket ssh sshd 2>/dev/null; then _seam_ok "ssh 서버 켜져 있음 (다른 기계에서 이 기계로 붙을 수 있음)"
+  else _seam_note "ssh 서버 꺼짐 - 다른 기계에서 이 기계로 붙게 하려면: sudo apt install openssh-server"; fi
+
+  # 1. 이 기계 이름
+  _seam_load 2>/dev/null
+  local self=$SEAM_SELF
+  if [ -z "$self" ]; then
+    self=$(hostname -s)
+    case $self in debian|ubuntu|localhost|raspberrypi|ubuntu-*|"") self=$USER ;; esac
+  fi
+  echo
+  ask "이 기계 이름 (짧게, 예: home, laptop)" "$self"; self=$REPLY
+
+  local names=() targets=() ports=() m fin= i
+  for m in "${SEAM_NAMES[@]}"; do
+    [ "${SEAM_TARGET[$m]}" = local ] && continue
+    [ "$m" = "$self" ] && continue
+    names+=("$m"); targets+=("${SEAM_TARGET[$m]}"); ports+=("${SEAM_PORT[$m]}")
+  done
+
+  # 2. 다른 기계 추가
+  echo -e "\n\e[1m[2/3] 묶을 다른 기계\e[0m"
+  if [ ${#names[@]} -gt 0 ]; then
+    for i in "${!names[@]}"; do _seam_ok "${names[$i]}  (${targets[$i]}${ports[$i]:+ 포트 ${ports[$i]}})"; done
+    yesno "기계를 더 추가할까요?" N || fin=1
+  fi
+  while [ -z "$fin" ]; do
+    echo
+    ask "다른 기계 이름 (그만하려면 엔터)" ""; local name=$REPLY
+    [ -z "$name" ] && break
+    ask "$name 주소 (IP, 예: 192.168.0.5 / 또는 ~/.ssh/config 의 Host 이름)" ""; local addr=$REPLY
+    [ -z "$addr" ] && continue
+    local target=$addr port=
+    if ssh -o BatchMode=yes -o ConnectTimeout=5 "$addr" true 2>/dev/null; then
+      _seam_ok "ssh $addr 바로 연결됨"
+    else
+      local du=$USER; [[ $addr == *@* ]] && du=${addr%%@*}
+      ask "$name 의 사용자 이름" "$du"
+      local user=$REPLY host=${addr#*@}
+      ask "$name 의 ssh 포트" 22; port=$REPLY
+      [ "$port" = 22 ] && port=
+      target="$user@$host"
+      local key=$HOME/.ssh/id_ed25519
+      if [ ! -f "$key" ]; then
+        mkdir -p ~/.ssh && chmod 700 ~/.ssh
+        ssh-keygen -q -t ed25519 -N "" -f "$key" -C "seam@$self" && _seam_ok "ssh 키 만듦 ($key)"
+      fi
+      if ssh ${port:+-p $port} -o BatchMode=yes -o ConnectTimeout=5 "$target" true 2>/dev/null; then
+        _seam_ok "$target 연결됨"
+      else
+        echo -e "  \e[1m$target 의 비밀번호를 한 번만 입력하세요\e[0m (다음부터는 키로 자동 접속)"
+        if ssh-copy-id -i "$key.pub" ${port:+-p $port} -o ConnectTimeout=8 "$target" >/dev/null 2>/tmp/seam-copyid.err \
+           && ssh ${port:+-p $port} -o BatchMode=yes -o ConnectTimeout=5 "$target" true 2>/dev/null; then
+          _seam_ok "키 등록 완료 - 이제 비밀번호 없이 연결됩니다"
+        else
+          _seam_bad "연결 실패: $(tail -1 /tmp/seam-copyid.err)"
+          _seam_note "확인: 그 기계가 켜져 있나? ssh 서버(openssh-server)가 있나? 주소/포트가 맞나?"
+          yesno "그래도 목록에 넣을까요?" N || continue
+        fi
+      fi
+    fi
+    local info
+    info=$(ssh ${port:+-p $port} -o BatchMode=yes -o ConnectTimeout=5 "$target" \
+      'echo "$(nproc)코어, $(awk "/MemTotal/{printf \"%.1fGB\", \$2/1048576}" /proc/meminfo) RAM, $(uname -sr)"' 2>/dev/null) \
+      && _seam_ok "$name: $info"
+    for i in "${!names[@]}"; do [ "${names[$i]}" = "$name" ] && unset 'names[i]' 'targets[i]' 'ports[i]'; done
+    names+=("$name"); targets+=("$target"); ports+=("$port")
+    yesno "기계를 더 추가할까요?" N || break
+  done
+
+  # 3. 저장
+  echo -e "\n\e[1m[3/3] 저장\e[0m"
+  mkdir -p "$(dirname "$SEAM_CONF")"
+  {
+    echo "# Seam 기계 목록 - seam setup 이 만듦 (직접 고쳐도 됨)"
+    echo "# 이름  주소(local = 이 기계)  [ssh포트]"
+    printf '%-8s %s\n' "$self" local
+    for i in "${!names[@]}"; do printf '%-8s %s %s\n' "${names[$i]}" "${targets[$i]}" "${ports[$i]}"; done
+  } > "$SEAM_CONF"
+  _seam_ok "저장됨: $SEAM_CONF"
+  echo
+  cmd_doctor quiet
+  echo -e "\n  이제 \e[1;36mseam\e[0m 을 입력하면 시작합니다."
+}
+
+# ---------------- doctor ----------------
+cmd_doctor() {
+  [ "$1" = quiet ] || banner
+  _seam_load || { _seam_bad "설정이 없습니다 -> seam setup"; return 1; }
+  local m bad=0
+  for m in "${SEAM_NAMES[@]}"; do
+    if [ "$m" = "$SEAM_SELF" ]; then _seam_ok "$m  (이 기계)"; continue; fi
+    if _seam_ssh "$m" -n -- true 2>/dev/null; then
+      _seam_ok "$m  ssh ${SEAM_TARGET[$m]}${SEAM_PORT[$m]:+:${SEAM_PORT[$m]}}"
+    else
+      _seam_bad "$m  ssh ${SEAM_TARGET[$m]} 연결 안 됨 (꺼져 있거나 키 미등록 -> seam setup)"; bad=1
+    fi
+  done
+  command -v sshfs >/dev/null || { _seam_bad "sshfs 없음 -> sudo apt install sshfs"; bad=1; }
+  return $bad
+}
+
+# ---------------- 시작 ----------------
+cmd_start() {
+  if ! _seam_load; then
+    banner
+    echo -e "  처음이시네요! 먼저 설정부터 합니다.\n"
+    cmd_setup || return 1
+    _seam_load || return 1
+    echo; read -rp "  엔터를 누르면 Seam 을 시작합니다..." _
+  fi
+  mkdir -p "$SEAM/home"
+  ln -sfn "$HOME" "$SEAM/home/$SEAM_SELF"
+
+  banner
+  printf '  %-8s \e[1;32m✓\e[0m 이 기계\n' "$SEAM_SELF"
+  local m p
+  for m in $(_seam_others); do
+    p="$SEAM/home/$m"; mkdir -p "$p"
+    printf '  %-8s ' "$m"
+    if mountpoint -q "$p"; then
+      printf '\e[1;32m✓\e[0m 연결됨 (이미 붙어 있음)\n'
+    elif ! command -v sshfs >/dev/null; then
+      printf '\e[1;31m✗\e[0m sshfs 없음 (sudo apt install sshfs)\n'
+    elif sshfs ${SEAM_PORT[$m]:+-p "${SEAM_PORT[$m]}"} "${SEAM_TARGET[$m]}:" "$p" \
+           -o reconnect,ServerAliveInterval=15,idmap=user,follow_symlinks,BatchMode=yes,ConnectTimeout=5 2>/tmp/seam-sshfs.err; then
+      printf '\e[1;32m✓\e[0m 연결됨 (ssh %s)\n' "${SEAM_TARGET[$m]}"
+    else
+      printf '\e[2m✗ offline (%s)\e[0m\n' "$(head -c 70 /tmp/seam-sshfs.err | tr -d '\n')"
+    fi
+  done
+  printf '\n  \e[2mhelp = 사용법, exit = 나가기\e[0m\n\n'
+
+  cd "$SEAM" && bash --rcfile "$SEAM_DIR/linux/seamrc" -i
+
+  # 마지막 Seam 창을 닫을 때만 연결 해제
+  if ! pgrep -u "$(id -u)" -f -- "--rcfile $SEAM_DIR/linux/seamrc" >/dev/null; then
+    for m in $(_seam_others); do
+      mountpoint -q "$SEAM/home/$m" && fusermount -u "$SEAM/home/$m" 2>/dev/null
+    done
+  fi
+}
+
+# seam run: 셸 밖에서 run 한 번
+cmd_run() {
+  _seam_load || { echo "seam: 설정이 없습니다 -> seam setup" >&2; return 1; }
+  export SEAM_CLI=1
+  source "$SEAM_DIR/linux/seamrc"
+  run "$@"
+}
+
+main() {
+case $1 in
+  ''|start) cmd_start ;;
+  run) shift; cmd_run "$@" ;;
+  setup) cmd_setup ;;
+  doctor) cmd_doctor ;;
+  -v|--version|version) echo "seam $SEAM_VERSION" ;;
+  -h|--help|help)
+    cat <<H
+seam          Seam 시작 (안에서 help 로 사용법)
+seam run ...  셸 밖에서 run 한 번 (예: seam run --gpu python train.py)
+seam setup    처음 설정 / 기계 추가 (ssh 키 만들기, 비밀번호 한 번으로 키 등록, sshfs 확인)
+seam doctor   기계 연결 상태 점검
+설정 파일:    $SEAM_CONF
+H
+    ;;
+  *) echo "seam: 모르는 명령 '$1' (seam help)" >&2; exit 1 ;;
+esac
+}
+
+# main 과 exit 를 같은 줄에서 읽게 해서, 실행 중 파일이 수정돼도 뒤를 다시 읽지 않게 한다
+main "$@"; exit

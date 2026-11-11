@@ -1,0 +1,112 @@
+# Seam 셸 설정: 진짜 bash에 "#" 루트만 얹는다 (seam 실행기가 불러 줌)
+source "$SEAM_DIR/linux/common.sh"
+_seam_load || { echo "seam: 기계 목록이 없습니다. 먼저 seam setup" >&2; exit 1; }
+export LANG=C.UTF-8
+shopt -u interactive_comments        # '#'을 주석이 아니라 경로로 쓰기 위해
+HISTFILE=$HOME/.seam_history
+[ -f "$HOME/.bash_aliases" ] && source "$HOME/.bash_aliases" 2>/dev/null
+
+_seam_pwd() {
+  case $PWD in
+    "$SEAM") printf '#' ;;
+    "$SEAM"/*) printf '#%s' "${PWD#$SEAM}" ;;
+    "$HOME"|"$HOME"/*) printf '#/home/%s%s' "$SEAM_SELF" "${PWD#$HOME}" ;;
+    *) printf '%s' "$PWD" ;;
+  esac
+}
+PS1='\[\e[1;36m\]$(_seam_pwd)\[\e[0m\]> '
+
+# @/경로 -> 그 경로가 있는 기계 (여러 곳이면 후보만 안내)
+_seam_find() {
+  local rel=$1 m hits=() mode
+  for m in "${SEAM_NAMES[@]}"; do
+    case $rel in
+      "$m"|"$m"/*)
+        _seam_online "$m" || { printf 'seam: %s 가 연결돼 있지 않습니다 (offline)\n' "$m" >&2; return 1; }
+        _SEAM_FOUND="$SEAM/home/$rel"; return 0 ;;
+    esac
+  done
+  for mode in -e -d; do  # 새 파일이면 부모 폴더로 찾음
+    hits=()
+    [ $mode = -d ] && case $rel in */*) ;; *) break ;; esac
+    for m in "${SEAM_NAMES[@]}"; do
+      _seam_online "$m" || continue
+      if [ $mode = -e ]; then [ -e "$SEAM/home/$m/$rel" ] && hits+=("$m")
+      else [ -d "$SEAM/home/$m/$(dirname "$rel")" ] && hits+=("$m"); fi
+    done
+    [ ${#hits[@]} -gt 0 ] && break
+  done
+  case ${#hits[@]} in
+    1) _SEAM_FOUND="$SEAM/home/${hits[0]}/$rel"; return 0 ;;
+    0) printf 'seam: @/%s : 어느 기계에도 없습니다 (%s)\n' "$rel" "${SEAM_NAMES[*]}" >&2 ;;
+    *) printf 'seam: @/%s : %s 에 다 있습니다. 골라 주세요:\n' "$rel" "${hits[*]}" >&2
+       for m in "${hits[@]}"; do printf '  #/home/%s/%s\n' "$m" "$rel" >&2; done ;;
+  esac
+  return 1
+}
+
+_seam_map() {
+  _SEAM_ARGS=()
+  local a
+  for a in "$@"; do
+    case $a in
+      '#') _SEAM_ARGS+=("$SEAM") ;;
+      '#/'*) _SEAM_ARGS+=("$SEAM${a:1}") ;;
+      '@/'*) _seam_find "${a:2}" || return 1; _SEAM_ARGS+=("$_SEAM_FOUND") ;;
+      *) _SEAM_ARGS+=("$a") ;;
+    esac
+  done
+}
+_seam_run() { local c=$1; shift; _seam_map "$@" || return 1; command "$c" "${_SEAM_ARGS[@]}"; }
+for _c in cat cp mv rm mkdir rmdir touch less head tail du find grep file stat nano; do
+  eval "$_c() { _seam_run $_c \"\$@\"; }"
+done
+unset _c
+
+if command -v vim >/dev/null; then _SEAM_VIM=vim; else _SEAM_VIM=vim.tiny; fi
+vim() { _seam_run $_SEAM_VIM "$@"; }
+vi() { _seam_run $_SEAM_VIM "$@"; }
+
+cd() {
+  if [ $# -eq 0 ]; then builtin cd "$SEAM"; return; fi
+  _seam_map "$@" || return 1
+  local old=$PWD
+  builtin cd "${_SEAM_ARGS[@]}" || return 1
+  case $PWD in
+    "$SEAM"|"$SEAM"/*) ;;
+    *) if [ "$PWD" = "${SEAM%/*}" ]; then
+         builtin cd "$SEAM"; echo "seam: # 이 맨 위입니다" >&2
+       else
+         builtin cd "$old"; echo "seam: # 밖으로는 갈 수 없습니다" >&2
+       fi
+       OLDPWD=$old; return 1 ;;
+  esac
+}
+
+ls() {
+  if [ $# -eq 0 ] && [ "$PWD" = "$SEAM" ]; then
+    local m
+    for m in "${SEAM_NAMES[@]}"; do
+      if _seam_online "$m"; then printf '\e[1;32m#/home/%s\e[0m  ' "$m"
+      else printf '\e[2m#/home/%s (offline)\e[0m  ' "$m"; fi
+    done
+    echo
+  else
+    _seam_run ls --color=auto "$@"
+  fi
+}
+
+help() {
+  local me=$SEAM_SELF o; o=$(_seam_others | head -1); o=${o:-other}
+  cat <<H
+Seam $SEAM_VERSION = 진짜 리눅스 셸 + 기계들(${SEAM_NAMES[*]})의 홈을 한 루트 # 아래로.
+  ls                        묶인 기계들 보기
+  cd #/home/$o              $o 의 홈으로    (cd = # 로 돌아가기)
+  cd @/$o                   위와 같음 (@/기계이름 = 그 기계 홈)
+  cd @/git                  git 폴더가 있는 기계로 (여러 곳에 있으면 후보를 알려줌)
+  cp #/home/$o/a.txt #/home/$me/   기계 사이 복사
+  vim, nano, cat ...        #/ @/ 경로 그대로 사용 가능
+  exit                      Seam 나가기
+홈은 전부 진짜이고 쓰기 가능: rm 하면 정말 지워집니다.
+H
+}

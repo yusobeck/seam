@@ -1,0 +1,362 @@
+# Seam 셸 설정: 진짜 bash에 "#" 루트만 얹는다 (seam 실행기가 불러 줌)
+source "$SEAM_DIR/linux/common.sh"
+_seam_load || { echo "seam: 기계 목록이 없습니다. 먼저 seam setup" >&2; exit 1; }
+export LANG=C.UTF-8
+if [ -z "$SEAM_CLI" ]; then
+  shopt -u interactive_comments        # '#'을 주석이 아니라 경로로 쓰기 위해
+  HISTFILE=$HOME/.seam_history
+  [ -f "$HOME/.bash_aliases" ] && source "$HOME/.bash_aliases" 2>/dev/null
+fi
+
+_seam_pwd() {
+  case $PWD in
+    "$SEAM") printf '#' ;;
+    "$SEAM"/*) printf '#%s' "${PWD#$SEAM}" ;;
+    "$HOME"|"$HOME"/*) printf '#/home/%s%s' "$SEAM_SELF" "${PWD#$HOME}" ;;
+    *) printf '%s' "$PWD" ;;
+  esac
+}
+PS1='\[\e[1;36m\]$(_seam_pwd)\[\e[0m\]> '
+
+# @/경로 -> 그 경로가 있는 기계 (여러 곳이면 후보만 안내)
+_seam_find() {
+  local rel=$1 m hits=() mode
+  for m in "${SEAM_NAMES[@]}"; do
+    case $rel in
+      "$m"|"$m"/*)
+        _seam_online "$m" || { printf 'seam: %s 가 연결돼 있지 않습니다 (offline)\n' "$m" >&2; return 1; }
+        _SEAM_FOUND="$SEAM/home/$rel"; return 0 ;;
+    esac
+  done
+  for mode in -e -d; do  # 새 파일이면 부모 폴더로 찾음
+    hits=()
+    [ $mode = -d ] && case $rel in */*) ;; *) break ;; esac
+    for m in "${SEAM_NAMES[@]}"; do
+      _seam_online "$m" || continue
+      if [ $mode = -e ]; then [ -e "$SEAM/home/$m/$rel" ] && hits+=("$m")
+      else [ -d "$SEAM/home/$m/$(dirname "$rel")" ] && hits+=("$m"); fi
+    done
+    [ ${#hits[@]} -gt 0 ] && break
+  done
+  case ${#hits[@]} in
+    1) _SEAM_FOUND="$SEAM/home/${hits[0]}/$rel"; return 0 ;;
+    0) printf 'seam: @/%s : 어느 기계에도 없습니다 (%s)\n' "$rel" "${SEAM_NAMES[*]}" >&2 ;;
+    *) printf 'seam: @/%s : %s 에 다 있습니다. 골라 주세요:\n' "$rel" "${hits[*]}" >&2
+       for m in "${hits[@]}"; do printf '  #/home/%s/%s\n' "$m" "$rel" >&2; done ;;
+  esac
+  return 1
+}
+
+_seam_map() {
+  _SEAM_ARGS=()
+  local a
+  for a in "$@"; do
+    case $a in
+      '#/dev'|'#/dev/'*) _seam_dev_refresh; _SEAM_ARGS+=("$SEAM${a:1}") ;;
+      '#') _SEAM_ARGS+=("$SEAM") ;;
+      '#/'*) _SEAM_ARGS+=("$SEAM${a:1}") ;;
+      '@/'*) _seam_find "${a:2}" || return 1; _SEAM_ARGS+=("$_SEAM_FOUND") ;;
+      *) _SEAM_ARGS+=("$a") ;;
+    esac
+  done
+}
+_seam_run() { local c=$1; shift; _seam_map "$@" || return 1; command "$c" "${_SEAM_ARGS[@]}"; }
+for _c in cat cp mv rm mkdir rmdir touch less head tail du find grep file stat nano; do
+  eval "$_c() { _seam_run $_c \"\$@\"; }"
+done
+unset _c
+btop() {
+  local m
+  for m in "${SEAM_NAMES[@]}"; do
+    [ "$m" = "$SEAM_SELF" ] && continue
+    case $PWD in "$SEAM/home/$m"|"$SEAM/home/$m/"*) run --on "$m" btop "$@"; return ;; esac
+  done
+  command btop "$@"
+}
+
+if command -v vim >/dev/null; then _SEAM_VIM=vim; else _SEAM_VIM=vim.tiny; fi
+vim() { _seam_run $_SEAM_VIM "$@"; }
+vi() { _seam_run $_SEAM_VIM "$@"; }
+
+cd() {
+  if [ $# -eq 0 ]; then builtin cd "$SEAM"; return; fi
+  _seam_map "$@" || return 1
+  local old=$PWD
+  builtin cd "${_SEAM_ARGS[@]}" || return 1
+  case $PWD in
+    "$SEAM"|"$SEAM"/*) ;;
+    *) if [ "$PWD" = "${SEAM%/*}" ]; then
+         builtin cd "$SEAM"; echo "seam: # 이 맨 위입니다" >&2
+       else
+         builtin cd "$old"; echo "seam: # 밖으로는 갈 수 없습니다" >&2
+       fi
+       OLDPWD=$old; return 1 ;;
+  esac
+}
+
+# ---- #/dev: 기계별 CPU/메모리/GPU ----
+_SEAM_PROBE='
+echo "home $HOME"
+echo "cpus $(nproc)"
+echo "load $(cut -d" " -f1 /proc/loadavg)"
+read -r _ u n sy i w q sq st _ < /proc/stat; t1=$((u+n+sy+i+w+q+sq+st)); i1=$((i+w))
+sleep 0.4
+read -r _ u n sy i w q sq st _ < /proc/stat; t2=$((u+n+sy+i+w+q+sq+st)); i2=$((i+w))
+[ $t2 -gt $t1 ] && echo "cpu_busy_pct $(( 100*((t2-t1)-(i2-i1))/(t2-t1) ))" || echo "cpu_busy_pct 0"
+awk "/MemTotal/{t=\$2}/MemAvailable/{a=\$2}END{printf \"mem_total_mb %d\nmem_free_mb %d\n\",t/1024,a/1024}" /proc/meminfo
+if command -v nvidia-smi >/dev/null 2>&1; then
+  nvidia-smi --query-gpu=name,utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null |
+    awk -F", " "NR==1{printf \"gpu %s\ngpu_util_pct %s\ngpu_mem_mb %s/%s\n\",\$1,\$2,\$3,\$4}"
+else echo "gpu none"; fi
+grep -m1 "model name" /proc/cpuinfo | sed "s/.*: */cpu_raw /"
+lspci 2>/dev/null | grep -iE "vga|3d controller" | tail -1 | sed "s/^[^ ]* [^:]*: */gpu_raw /"
+'
+_seam_dev_refresh() {
+  local m out k v
+  for m in "${SEAM_NAMES[@]}"; do
+    command mkdir -p "$SEAM/dev/$m"
+    if [ "$m" = "$SEAM_SELF" ]; then out=$(bash -c "$_SEAM_PROBE" 2>/dev/null)
+    elif _seam_online "$m"; then out=$(_seam_ssh "$m" -n -o ConnectTimeout=3 -- "$_SEAM_PROBE" 2>/dev/null)
+    else out=; fi
+    command rm -f "$SEAM/dev/$m"/*
+    [ -z "$out" ] && { echo offline > "$SEAM/dev/$m/status"; continue; }
+    echo online > "$SEAM/dev/$m/status"
+    local cpu_raw= gpu_raw=
+    while read -r k v; do
+      case $k in
+        cpu_raw) cpu_raw=$v ;;
+        gpu_raw) gpu_raw=$v ;;
+        *) printf '%s\n' "$v" > "$SEAM/dev/$m/$k" ;;
+      esac
+    done <<<"$out"
+    _seam_cpu_name "$cpu_raw" > "$SEAM/dev/$m/cpu_name"
+    if [ "$(_seam_dev_get $m gpu)" != none ]; then _seam_dev_get $m gpu
+    else _seam_gpu_name "$gpu_raw"; fi > "$SEAM/dev/$m/gpu_name"
+  done
+}
+_seam_cpu_name() { [ -z "$1" ] && { echo -; return; }
+  sed -e 's/(R)//g; s/(TM)//g; s/ CPU / /; s/@ //; s/  */ /g; s/^ //; s/ $//' <<<"$1"; }
+_seam_gpu_name() { [ -z "$1" ] && { echo -; return; }
+  local r=${1% (rev *)} v=${1%% *} n
+  case $1 in NVIDIA*) v=NVIDIA ;; Advanced\ Micro*|AMD*|ATI*) v=AMD ;; Intel*) v=Intel ;; esac
+  if [[ $r == *\] ]]; then n=${r##*[}; n=${n%]}; else n=${r#*: }; fi
+  echo "$v $n"; }
+_seam_dev_get() { command cat "$SEAM/dev/$1/$2" 2>/dev/null || echo -; }
+
+# ---- top ----
+top() {
+  _seam_dev_refresh
+  printf '\e[1m%-6s %-7s %-5s %-6s %-6s %-14s %s\e[0m\n' MACH STATUS CPUS CPU% LOAD MEM_FREE/TOT GPU
+  local m g
+  for m in "${SEAM_NAMES[@]}"; do
+    if [ "$(_seam_dev_get $m status)" != online ]; then
+      printf '%-6s \e[2moffline\e[0m\n' "$m"; continue; fi
+    g=$(_seam_dev_get $m gpu)
+    [ "$g" != none ] && g="$g $(_seam_dev_get $m gpu_util_pct)% $(_seam_dev_get $m gpu_mem_mb)MB"
+    printf '%-6s \e[1;32m%-7s\e[0m %-5s %-6s %-6s %-14s %s\n' "$m" online \
+      "$(_seam_dev_get $m cpus)" "$(_seam_dev_get $m cpu_busy_pct)%" "$(_seam_dev_get $m load)" \
+      "$(_seam_dev_get $m mem_free_mb)/$(_seam_dev_get $m mem_total_mb)" "$g"
+  done
+  for m in "${SEAM_NAMES[@]}"; do
+    _seam_online "$m" || continue
+    echo; echo "[$m] 바쁜 프로세스"
+    if [ "$m" = "$SEAM_SELF" ]; then ps -eo pcpu,comm --sort=-pcpu | sed -n 2,4p
+    else _seam_ssh "$m" -n -o ConnectTimeout=3 -- 'ps -eo pcpu,comm --sort=-pcpu | sed -n 2,4p' 2>/dev/null; fi
+  done
+}
+
+# ---- run: 덜 바쁜 기계에서 실행 ----
+_seam_run_where() {
+  local gpu=$1 on=$2 jobs=$3 verbose=$4 m best= bestfree=-1 bestmem=-1 free mem gl
+  _seam_dev_refresh
+  for m in "${SEAM_NAMES[@]}"; do
+    [ "$(_seam_dev_get $m status)" = online ] || continue
+    [ -n "$on" ] && [ "$m" != "$on" ] && continue
+    [ "$gpu" = 1 ] && [ "$(_seam_dev_get $m gpu)" = none ] && continue
+    free=$(awk -v c="$(_seam_dev_get $m cpus)" -v b="$(_seam_dev_get $m cpu_busy_pct)" -v l="$(_seam_dev_get $m load)" \
+      'BEGIN{if(b=="-")f=c-l; else f=c*(1-b/100); if(f<0)f=0; printf "%.1f", f}')
+    mem=$(_seam_dev_get $m mem_free_mb)
+    if [ "$verbose" = 1 ]; then
+      gl=$(_seam_dev_get $m gpu_name)
+      if [ "$(_seam_dev_get $m gpu)" != none ]; then
+        gl="$gl  ($(awk -F/ '{printf "%.1fGB, 사용 중 %.1fGB", $2/1024, $1/1024}' <<<"$(_seam_dev_get $m gpu_mem_mb)"), 사용률 $(_seam_dev_get $m gpu_util_pct)%)"
+      else gl="$gl  (계산용 GPU 아님 -> --gpu 불가)"; fi
+      printf '  \e[1m%s\e[0m%s\n' "$m" "$([ "$m" = "$SEAM_SELF" ] && echo ' (이 기계)')" >&2
+      printf '    CPU  %s  %s코어 (사용 중 %s%%, 여유 %s)\n' "$(_seam_dev_get $m cpu_name)" "$(_seam_dev_get $m cpus)" "$(_seam_dev_get $m cpu_busy_pct)" "$free" >&2
+      printf '    RAM  %s\n' "$(awk -v t="$(_seam_dev_get $m mem_total_mb)" -v f="$mem" 'BEGIN{printf "%.1fGB (여유 %.1fGB)", t/1024, f/1024}')" >&2
+      printf '    GPU  %s\n' "$gl" >&2
+    fi
+    if awk -v a="$free" -v b="$bestfree" -v x="$mem" -v y="$bestmem" 'BEGIN{exit !(a>b || (a==b && x>y))}'; then
+      best=$m bestfree=$free bestmem=$mem
+      _SEAM_PICKWHY="여유 코어 $free/$(_seam_dev_get $m cpus)"
+    fi
+  done
+  _SEAM_PICK=$best
+  if [ -z "$best" ]; then
+    if [ "$gpu" = 1 ]; then echo "seam: GPU 쓸 수 있는 기계가 없습니다${on:+ ($on 에는 GPU 없음)}" >&2
+    else echo "seam: 쓸 수 있는 기계가 없습니다${on:+ ($on offline)}" >&2; fi
+    return 1
+  fi
+  if [ -n "$jobs" ] && awk -v f="$bestfree" -v j="$jobs" 'BEGIN{exit !(f<j)}'; then
+    printf '  (주의: %s코어 여유가 있는 기계가 없어 가장 한가한 %s 로 갑니다)\n' "$jobs" "$best" >&2
+  fi
+}
+
+_seam_home_of() { [ "$1" = "$SEAM_SELF" ] && { echo "$HOME"; return; }
+  local h; h=$(_seam_dev_get "$1" home); [ "$h" = - ] && h=/home/$1; echo "$h"; }
+
+_seam_remote_isdir() {
+  [ -d "$SEAM/home/$1$2" ] && return 0
+  mountpoint -q "$SEAM/home/$1" && return 1
+  _seam_ssh "$1" -n -- "test -d \"\$HOME$2\"" 2>/dev/null
+}
+
+_seam_run_dir() {
+  local t=$1 rel= who= m
+  for m in "${SEAM_NAMES[@]}"; do
+    case $PWD in "$SEAM/home/$m"|"$SEAM/home/$m/"*) who=$m rel=${PWD#$SEAM/home/$m} ;; esac
+  done
+  case $PWD in "$HOME"|"$HOME/"*) who=$SEAM_SELF rel=${PWD#$HOME} ;; esac
+  if [ "$t" = "$SEAM_SELF" ]; then
+    if [ -n "$who" ]; then _SEAM_DIR=$PWD; else _SEAM_DIR=$HOME; fi
+    return
+  fi
+  local th; th=$(_seam_home_of "$t")
+  _SEAM_DIR=$th$rel
+  if [ -n "$who" ] && [ "$who" != "$t" ] && [ -n "$rel" ] && ! _seam_remote_isdir "$t" "$rel"; then
+    printf '  (%s 에는 ~%s 폴더가 없어서 %s 홈에서 실행합니다)\n' "$t" "$rel" "$t" >&2
+    _SEAM_DIR=$th
+  fi
+}
+
+_seam_run_args() {
+  local t=$1 a p; shift
+  _SEAM_RARGS=()
+  for a in "$@"; do
+    case $a in
+      '#'|'#/'*|'@/'*) _seam_map "$a" || return 1; p=${_SEAM_ARGS[0]} ;;
+      *) _SEAM_RARGS+=("$a"); continue ;;
+    esac
+    if [ "$t" = "$SEAM_SELF" ]; then _SEAM_RARGS+=("$p"); continue; fi
+    case $p in
+      "$SEAM/home/$t"|"$SEAM/home/$t/"*) _SEAM_RARGS+=("$(_seam_home_of "$t")${p#$SEAM/home/$t}") ;;
+      *) printf 'seam: %s 는 %s 에서 안 보이는 파일입니다 (cp로 먼저 옮기거나 --on 으로 기계 지정)\n' "$a" "$t" >&2
+         return 1 ;;
+    esac
+  done
+}
+
+run() {
+  local gpu=0 on= jobs= port= rc m
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --gpu) gpu=1 ;;
+      --on) on=$2; shift ;;
+      --on=*) on=${1#--on=} ;;
+      -j[0-9]*) jobs=${1#-j} ;;
+      --port) port=$2; shift ;;
+      --port=*) port=${1#--port=} ;;
+      -h|--help)
+        cat <<H
+run [옵션] 명령 [인자...]   덜 바쁜 기계(${SEAM_NAMES[*]})에서 명령 실행
+  --gpu        GPU(NVIDIA) 있는 기계에서
+  --on 이름    기계 직접 지정
+  -j4          4코어 여유 있는 기계 우선
+  --port 8000  실행하는 기계와 이 기계 둘 다 localhost:8000 으로 접속 가능
+  run 'a | b'  파이프 등 셸 문법은 따옴표로 한 덩어리로
+  run          (명령 없이) 기계 사양 + 지금이면 어디로 갈지 보기
+H
+        return 0 ;;
+      --) shift; break ;;
+      *) break ;;
+    esac
+    shift
+  done
+  if [ -n "$on" ] && ! printf '%s\n' "${SEAM_NAMES[@]}" | command grep -qx -- "$on"; then
+    echo "seam: --on 은 ${SEAM_NAMES[*]} 중 하나" >&2; return 1; fi
+
+  _seam_run_where "$gpu" "$on" "$jobs" $(($# == 0)) || return 1
+  local t=$_SEAM_PICK
+  if [ $# -eq 0 ]; then printf -- '-> 지금 run 하면 \e[1;32m%s\e[0m 에서 실행됩니다\n' "$t"; return 0; fi
+  _seam_run_dir "$t"
+  _seam_run_args "$t" "$@" || return 1
+  local -a cmd=("${_SEAM_RARGS[@]}")
+
+  local shown=$_SEAM_DIR th
+  if [ "$t" = "$SEAM_SELF" ]; then
+    case $shown in "$SEAM"/*) shown="#${shown#$SEAM}" ;; "$HOME"*) shown="#/home/$t${shown#$HOME}" ;; esac
+  else th=$(_seam_home_of "$t"); shown="#/home/$t${_SEAM_DIR#$th}"; fi
+  printf -- '\e[1;36m-> %s\e[0m  %s  (%s)\n' "$t" "$shown" "$_SEAM_PICKWHY" >&2
+
+  # --port: 원격에서 돌면 이 기계로 -L, 이 기계에서 돌면 다른 기계들로 -R
+  local socks=() s
+  if [ -n "$port" ]; then
+    local tun=()
+    if [ "$t" = "$SEAM_SELF" ]; then
+      for m in $(_seam_others); do _seam_online "$m" && tun+=("$m:-R"); done
+    else tun=("$t:-L"); fi
+    for s in "${tun[@]}"; do
+      m=${s%%:*}
+      local sock="${XDG_RUNTIME_DIR:-/tmp}/seam-tun-$port-$m"
+      [ -S "$sock" ] && _seam_ssh "$m" -S "$sock" -O exit -- 2>/dev/null
+      if _seam_ssh "$m" -f -N -M -S "$sock" -o ExitOnForwardFailure=yes ${s#*:} "$port:localhost:$port" -- 2>/dev/null; then
+        socks+=("$m:$sock")
+      else
+        printf '   (%s 쪽 포트 %s 터널을 못 열었습니다. 이미 쓰는 중일 수 있음)\n' "$m" "$port" >&2
+      fi
+    done
+    [ ${#socks[@]} -gt 0 ] && printf '   포트 %s: %s 에서 localhost:%s 로 접속됩니다\n' "$port" \
+      "$(printf '%s ' "$SEAM_SELF" "${socks[@]%%:*}" | sed 's/ $//')" "$port" >&2
+  fi
+
+  trap ':' INT  # Ctrl-C 는 명령만 끊고 터널 정리는 계속
+  local one=0; [ ${#cmd[@]} -eq 1 ] && [[ ${cmd[0]} == *[[:space:]\|\&\;\>\<]* ]] && one=1
+  if [ "$t" = "$SEAM_SELF" ]; then
+    if [ $one = 1 ]; then (builtin cd "$_SEAM_DIR" && bash -c "${cmd[0]}")
+    else (builtin cd "$_SEAM_DIR" && command "${cmd[@]}"); fi
+    rc=$?
+  else
+    local line
+    if [ $one = 1 ]; then line=${cmd[0]}; else line=$(printf '%q ' "${cmd[@]}"); fi
+    line="cd $(printf %q "$_SEAM_DIR") && $line"
+    local tt=-T; [ -t 0 ] && [ -t 1 ] && tt=-t
+    _seam_ssh "$t" -q $tt -- "bash -lc $(printf %q "$line")"
+    rc=$?
+  fi
+  trap - INT
+  for s in "${socks[@]}"; do _seam_ssh "${s%%:*}" -S "${s#*:}" -O exit -- 2>/dev/null; done
+  return $rc
+}
+
+ls() {
+  if [ $# -eq 0 ] && [ "$PWD" = "$SEAM" ]; then
+    local m
+    for m in "${SEAM_NAMES[@]}"; do
+      if _seam_online "$m"; then printf '\e[1;32m#/home/%s\e[0m  ' "$m"
+      else printf '\e[2m#/home/%s (offline)\e[0m  ' "$m"; fi
+    done
+    printf '\e[1;34m#/dev\e[0m\n'
+  else
+    _seam_run ls --color=auto "$@"
+  fi
+}
+
+help() {
+  local me=$SEAM_SELF o; o=$(_seam_others | head -1); o=${o:-other}
+  cat <<H
+Seam $SEAM_VERSION = 진짜 리눅스 셸 + 기계들(${SEAM_NAMES[*]})을 한 루트 # 아래로.
+  ls                        묶인 기계들 보기
+  cd #/home/$o              $o 의 홈으로    (cd = # 로 돌아가기)
+  cd @/$o                   위와 같음 (@/기계이름 = 그 기계 홈)
+  cd @/git                  git 폴더가 있는 기계로 (여러 곳에 있으면 물어봄)
+  cp #/home/$o/a.txt #/home/$me/   기계 사이 복사
+  vim, nano, cat ...        #/ @/ 경로 그대로 사용 가능
+  top                       모든 기계 CPU/RAM/GPU 한눈에
+  cat #/dev/$me/gpu_name    기계별 정보 파일 (ls #/dev/$o)
+  run                       기계 사양 + 지금 어디가 한가한지
+  run make                  가장 한가한 기계에서 실행   (run --help)
+  run --gpu python t.py     GPU 있는 기계에서
+  exit                      Seam 나가기
+홈은 전부 진짜이고 쓰기 가능: rm 하면 정말 지워집니다.
+H
+}
